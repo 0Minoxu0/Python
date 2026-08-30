@@ -4,12 +4,12 @@ import os
 import time
 import io
 import datetime
-import uuid
-import requests
+
+import aiohttp
 import discord
+
 from discord.ext import commands, tasks
 from discord import app_commands
-import aiohttp
 
 from gen import (
     generer_tous_prononcables_batch,
@@ -18,24 +18,12 @@ from gen import (
     ADMIN_MAX_GENS
 )
 
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# IMPORTANT :
-# NE METS PAS TON TOKEN DIRECTEMENT ICI.
-#
-# Windows CMD :
-# set DISCORD_TOKEN=TON_NOUVEAU_TOKEN
-#
-# PowerShell :
-# $env:DISCORD_TOKEN="TON_NOUVEAU_TOKEN"
-#
-# Linux :
-# export DISCORD_TOKEN="TON_NOUVEAU_TOKEN"
-
 TOKEN = os.getenv("DISCORD_TOKEN")
-
 
 OFFICIAL_GUILD_ID = 1320431531386208386
 
@@ -54,16 +42,26 @@ BATCH_SIZE = 100
 TARGET_STATUS_TEXT = "Rayko's Sniper #1"
 ROLE_FREEACCESS_NAME = "FreeAccess"
 
+
 # ============================================================
-# RATE LIMIT / STATUS CONFIG
+# RATE / PERFORMANCE
 # ============================================================
 
-# Ne pas envoyer un webhook pour chaque résultat.
-# Les résultats sont regroupés dans le message de statut.
-STATUS_UPDATE_INTERVAL = 2.0
+# Mise à jour du message principal.
+STATUS_UPDATE_INTERVAL = 1.0
 
-# Nombre maximum de pseudos affichés dans le message de statut.
-MAX_DISPLAYED_FOUND = 10
+# Nombre maximum de pseudos visibles dans le statut.
+MAX_DISPLAYED_FOUND = 100
+
+# Nombre maximum de requêtes Discord simultanées.
+DISCORD_CONCURRENCY = 20
+
+# Nombre maximum de requêtes Minecraft simultanées.
+MINECRAFT_CONCURRENCY = 50
+
+# Nombre maximum de requêtes Roblox simultanées.
+ROBLOX_CONCURRENCY = 50
+
 
 # ============================================================
 # LOCKS
@@ -72,15 +70,25 @@ MAX_DISPLAYED_FOUND = 10
 results_lock = asyncio.Lock()
 blacklist_lock = asyncio.Lock()
 
+
 # ============================================================
 # ETAT
 # ============================================================
 
-# {user_id: {platform: bool}}
+# {
+#     user_id: {
+#         "discord": True,
+#         "minecraft": False,
+#         "roblox": False
+#     }
+# }
 active_checks = {}
 
-# {user_id: timestamp}
+# {
+#     user_id: timestamp
+# }
 cooldowns = {}
+
 
 # ============================================================
 # PLATEFORMES
@@ -88,14 +96,14 @@ cooldowns = {}
 
 PLATFORMS_CONFIG = {
     "discord": ("Discord", "💬"),
-    "minecraft": ("Minecraft", "🌿"),
-    "roblox": ("Roblox", "🔴")
+    "minecraft": ("Minecraft", "⛏️"),
+    "roblox": ("Roblox", "🎮")
 }
+
 
 # ============================================================
 # COMMAND TREE
 # ============================================================
-
 
 class OwnerOnlyCommandTree(app_commands.CommandTree):
 
@@ -140,7 +148,7 @@ class OwnerOnlyCommandTree(app_commands.CommandTree):
 
 
 # ============================================================
-# DISCORD
+# BOT
 # ============================================================
 
 intents = discord.Intents.default()
@@ -169,10 +177,10 @@ bot = commands.Bot(
     )
 )
 
+
 # ============================================================
 # LOG
 # ============================================================
-
 
 def log_command(user, command_name):
 
@@ -199,7 +207,6 @@ def log_command(user, command_name):
 # ============================================================
 # JSON
 # ============================================================
-
 
 def load_results():
 
@@ -354,7 +361,6 @@ def load_proxies():
 # ASYNC FILE HELPERS
 # ============================================================
 
-
 async def async_load_results():
 
     async with results_lock:
@@ -403,7 +409,6 @@ async def is_blacklisted(user_id):
 # ============================================================
 # PROXY
 # ============================================================
-
 
 def formater_proxy_requests(proxy_str):
 
@@ -467,11 +472,10 @@ def get_random_proxy(proxies_list):
 # DISCORD CHECK
 # ============================================================
 
-
-def check_discord_custom_sync(
-    pseudo,
-    use_proxies,
-    proxies_list
+async def check_discord_api(
+    session,
+    pseudo: str,
+    semaphore
 ):
 
     url = (
@@ -479,7 +483,7 @@ def check_discord_custom_sync(
         "unique-username/username-attempt-unauthed"
     )
 
-    reqheaders = {
+    headers = {
         "Accept": "*/*",
         "Accept-Language": (
             "fr,fr-FR;q=0.8,"
@@ -488,149 +492,223 @@ def check_discord_custom_sync(
         "Content-Type": "application/json",
         "Origin": "https://discord.com",
         "Referer": "https://discord.com/register",
-        "Cookie": (
-            f"__dcfduid={str(uuid.uuid4())}"
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
         )
     }
 
-    body = json.dumps({
-        "username": pseudo
-    })
-
-    for attempt in range(3):
+    async with semaphore:
 
         try:
 
-            proxies = (
-                get_random_proxy(proxies_list)
-                if use_proxies
-                else None
-            )
-
-            response = requests.post(
+            async with session.post(
                 url,
-                headers=reqheaders,
-                data=body,
-                proxies=proxies,
-                timeout=2
+                headers=headers,
+                json={
+                    "username": pseudo
+                }
+            ) as response:
+
+                if response.status == 429:
+
+                    retry_after = (
+                        response.headers.get(
+                            "Retry-After"
+                        )
+                    )
+
+                    if retry_after:
+
+                        try:
+                            retry_after = float(
+                                retry_after
+                            )
+                        except ValueError:
+                            retry_after = 1.0
+
+                    else:
+
+                        retry_after = 1.0
+
+                    print(
+                        "[DISCORD] Rate limited "
+                        f"for {retry_after:.2f}s"
+                    )
+
+                    return "rate_limit"
+
+                if response.status == 400:
+
+                    return "pris"
+
+                if response.status != 200:
+
+                    print(
+                        "[DISCORD] HTTP "
+                        f"{response.status} "
+                        f"for {pseudo}"
+                    )
+
+                    return "erreur"
+
+                data = await response.json(
+                    content_type=None
+                )
+
+                if "taken" not in data:
+
+                    return "erreur"
+
+                if data["taken"]:
+
+                    return "pris"
+
+                return "libre"
+
+        except asyncio.TimeoutError:
+
+            return "erreur"
+
+        except aiohttp.ClientError as e:
+
+            print(
+                f"[DISCORD] HTTP error {pseudo}: {e}"
             )
 
-            if response.status_code == 429:
-
-                time.sleep(
-                    min(2 ** attempt, 5)
-                )
-
-                continue
-
-            if response.status_code == 400:
-                return "pris"
-
-            data = response.json()
-
-            if "taken" in data:
-
-                return (
-                    "libre"
-                    if not data["taken"]
-                    else "pris"
-                )
-
-            return "pris"
-
-        except requests.RequestException:
-
-            if use_proxies:
-                continue
-
             return "erreur"
 
-        except Exception:
+        except Exception as e:
+
+            print(
+                f"[DISCORD] Error {pseudo}: {e}"
+            )
 
             return "erreur"
-
-    return "erreur"
 
 
 # ============================================================
 # MINECRAFT
 # ============================================================
 
-
 async def check_minecraft_api(
     session,
     pseudo: str,
+    semaphore,
     proxy_str=None
 ):
 
-    try:
+    url = (
+        "https://api.mojang.com/users/profiles/minecraft/"
+        f"{pseudo}"
+    )
 
-        url = (
-            "https://api.mojang.com/users/profiles/minecraft/"
-            f"{pseudo}"
-        )
+    async with semaphore:
 
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=2)
-        ) as response:
+        try:
 
-            if response.status in (204, 404):
-                return "libre"
+            async with session.get(
+                url
+            ) as response:
 
-            if response.status == 200:
-                return "pris"
+                if response.status in (
+                    204,
+                    404
+                ):
 
-        return "erreur"
+                    return "libre"
 
-    except Exception:
+                if response.status == 200:
 
-        return "erreur"
+                    return "pris"
+
+                if response.status == 429:
+
+                    return "rate_limit"
+
+                return "erreur"
+
+        except asyncio.TimeoutError:
+
+            return "erreur"
+
+        except aiohttp.ClientError:
+
+            return "erreur"
+
+        except Exception as e:
+
+            print(
+                f"[MINECRAFT] Error {pseudo}: {e}"
+            )
+
+            return "erreur"
 
 
 # ============================================================
 # ROBLOX
 # ============================================================
 
-
 async def check_roblox_api(
     session,
     pseudo: str,
+    semaphore,
     proxy_str=None
 ):
 
-    try:
+    url = (
+        "https://auth.roblox.com/v1/usernames/validate"
+        f"?request.username={pseudo}"
+        "&request.birthday=2000-01-01"
+    )
 
-        url = (
-            "https://auth.roblox.com/v1/usernames/validate"
-            f"?request.username={pseudo}"
-            "&request.birthday=2000-01-01"
-        )
+    async with semaphore:
 
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=2)
-        ) as response:
+        try:
 
-            if response.status != 200:
-                return "erreur"
+            async with session.get(
+                url
+            ) as response:
 
-            data = await response.json()
+                if response.status == 429:
 
-            if data.get("code") == 0:
-                return "libre"
+                    return "rate_limit"
 
-            return "pris"
+                if response.status != 200:
 
-    except Exception:
+                    return "erreur"
 
-        return "erreur"
+                data = await response.json()
+
+                if data.get("code") == 0:
+
+                    return "libre"
+
+                return "pris"
+
+        except asyncio.TimeoutError:
+
+            return "erreur"
+
+        except aiohttp.ClientError:
+
+            return "erreur"
+
+        except Exception as e:
+
+            print(
+                f"[ROBLOX] Error {pseudo}: {e}"
+            )
+
+            return "erreur"
 
 
 # ============================================================
 # PERMISSIONS
 # ============================================================
-
 
 def is_admin(interaction):
 
@@ -648,7 +726,11 @@ def is_admin(interaction):
 
     return any(
         "admin" in role.name.lower()
-        for role in getattr(member, "roles", [])
+        for role in getattr(
+            member,
+            "roles",
+            []
+        )
     )
 
 
@@ -672,13 +754,12 @@ def get_user_role_info(interaction):
     ]
 
     admin = (
-        "administrator"
-        if getattr(
+        getattr(
             interaction.user.guild_permissions,
             "administrator",
             False
         )
-        else any(
+        or any(
             "admin" in role
             for role in roles
         )
@@ -690,28 +771,37 @@ def get_user_role_info(interaction):
     )
 
     if admin:
-        return "Admin", True, is_vip_user
+
+        return (
+            "Admin",
+            True,
+            is_vip_user
+        )
 
     if is_vip_user:
-        return "VIP", False, True
 
-    return "Member", False, False
+        return (
+            "VIP",
+            False,
+            True
+        )
+
+    return (
+        "Member",
+        False,
+        False
+    )
 
 
 # ============================================================
-# SAFE DISCORD SEND
+# SAFE FOLLOWUP
 # ============================================================
-
 
 async def safe_followup_send(
     interaction,
     *args,
     **kwargs
 ):
-
-    """
-    Envoie un followup en gérant proprement les 429.
-    """
 
     try:
 
@@ -727,19 +817,23 @@ async def safe_followup_send(
             retry_after = getattr(
                 e,
                 "retry_after",
-                None
+                2
             )
 
-            if retry_after is None:
+            try:
+                retry_after = float(
+                    retry_after
+                )
+            except Exception:
                 retry_after = 2
 
             retry_after = min(
-                float(retry_after),
+                retry_after,
                 10
             )
 
             print(
-                "[RATE LIMIT] Discord webhook. "
+                "[RATE LIMIT] Discord followup. "
                 f"Waiting {retry_after:.2f}s"
             )
 
@@ -771,9 +865,87 @@ async def safe_followup_send(
 
 
 # ============================================================
-# VIEWS
+# SAVE FOUND USERNAME
 # ============================================================
 
+async def save_found_username(
+    user_id,
+    platform,
+    username
+):
+
+    async with results_lock:
+
+        all_data = await asyncio.to_thread(
+            load_results
+        )
+
+        if user_id not in all_data:
+
+            all_data[user_id] = {
+                key: []
+                for key in PLATFORMS_CONFIG
+            }
+
+        if platform not in all_data[user_id]:
+
+            all_data[user_id][platform] = []
+
+        if username not in all_data[user_id][platform]:
+
+            all_data[user_id][platform].append(
+                username
+            )
+
+            await asyncio.to_thread(
+                save_results,
+                all_data
+            )
+
+            return True
+
+        return False
+
+
+# ============================================================
+# SEND FOUND EPHEMERAL
+# ============================================================
+
+async def send_found_ephemeral(
+    interaction,
+    username,
+    platform_display_name
+):
+
+    try:
+
+        await interaction.followup.send(
+            (
+                f"🎯 **New username found!**\n"
+                f"Platform: **{platform_display_name}**\n"
+                f"Username: `{username}`"
+            ),
+            ephemeral=True
+        )
+
+    except discord.HTTPException as e:
+
+        print(
+            f"[ERROR] Found ephemeral "
+            f"{username}: {e}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"[ERROR] Found message "
+            f"{username}: {e}"
+        )
+
+
+# ============================================================
+# VIEWS
+# ============================================================
 
 class ConfirmClearView(discord.ui.View):
 
@@ -874,7 +1046,6 @@ class ConfirmClearView(discord.ui.View):
 
 # ============================================================
 
-
 class ConfirmStopAllView(discord.ui.View):
 
     def __init__(self, user_id):
@@ -963,7 +1134,6 @@ class ConfirmStopAllView(discord.ui.View):
 
 # ============================================================
 
-
 class ResultsSelect(discord.ui.Select):
 
     def __init__(self, results_dict):
@@ -988,7 +1158,7 @@ class ResultsSelect(discord.ui.Select):
             )
 
         super().__init__(
-            placeholder="📂 Select a platform...",
+            placeholder="📋 Select a platform...",
             min_values=1,
             max_values=1,
             options=options
@@ -1028,15 +1198,19 @@ class ResultsSelect(discord.ui.Select):
 
             await safe_followup_send(
                 interaction,
-                f"❌ No usernames found for "
-                f"**{platform_name}**.",
+                (
+                    f"❌ No usernames found for "
+                    f"**{platform_name}**."
+                ),
                 ephemeral=True
             )
 
             return
 
         file_bytes = io.BytesIO(
-            "\n".join(pseudos).encode("utf-8")
+            "\n".join(pseudos).encode(
+                "utf-8"
+            )
         )
 
         discord_file = discord.File(
@@ -1049,7 +1223,10 @@ class ResultsSelect(discord.ui.Select):
         try:
 
             await interaction.user.send(
-                f"📂 **{platform_name}** usernames file:",
+                (
+                    f"📄 **{platform_name} "
+                    "usernames file:**"
+                ),
                 file=discord_file
             )
 
@@ -1067,7 +1244,7 @@ class ResultsSelect(discord.ui.Select):
 
             await safe_followup_send(
                 interaction,
-                "⚠️ Unable to send DM.",
+                "❌ Unable to send DM.",
                 ephemeral=True
             )
 
@@ -1087,34 +1264,37 @@ class ResultsView(discord.ui.View):
 
 # ============================================================
 
-
 class PlatformSelect(discord.ui.Select):
 
     def __init__(self):
 
         options = [
+
             discord.SelectOption(
                 label="Minecraft",
                 description="Scan Minecraft usernames",
-                emoji="🌿",
+                emoji="⛏️",
                 value="Minecraft"
             ),
+
             discord.SelectOption(
                 label="Roblox",
                 description="Scan Roblox usernames",
-                emoji="🔴",
+                emoji="🎮",
                 value="Roblox"
             ),
+
             discord.SelectOption(
                 label="Discord",
                 description="Scan Discord usernames",
                 emoji="💬",
                 value="Discord"
             )
+
         ]
 
         super().__init__(
-            placeholder="⚡ Choose a platform...",
+            placeholder="🎯 Choose a platform...",
             min_values=1,
             max_values=1,
             options=options
@@ -1149,7 +1329,6 @@ class PlatformView(discord.ui.View):
 # CHECK MODAL
 # ============================================================
 
-
 class CheckModal(discord.ui.Modal):
 
     def __init__(
@@ -1158,7 +1337,7 @@ class CheckModal(discord.ui.Modal):
     ):
 
         super().__init__(
-            title="Rayko's Sniper — Configuration"
+            title="Rayko's Sniper - Configuration"
         )
 
         self.chosen_platform = chosen_platform
@@ -1198,11 +1377,25 @@ class CheckModal(discord.ui.Modal):
             max_length=1
         )
 
-        self.add_item(self.mode_gen)
-        self.add_item(self.length)
-        self.add_item(self.numbers_mode)
-        self.add_item(self.prefix)
-        self.add_item(self.proxy_mode)
+        self.add_item(
+            self.mode_gen
+        )
+
+        self.add_item(
+            self.length
+        )
+
+        self.add_item(
+            self.numbers_mode
+        )
+
+        self.add_item(
+            self.prefix
+        )
+
+        self.add_item(
+            self.proxy_mode
+        )
 
     async def on_submit(
         self,
@@ -1242,8 +1435,12 @@ class CheckModal(discord.ui.Modal):
         # ROLE
         # =====================================================
 
-        role_name, is_admin_user, is_vip_user = (
-            get_user_role_info(interaction)
+        (
+            role_name,
+            is_admin_user,
+            is_vip_user
+        ) = get_user_role_info(
+            interaction
         )
 
         if is_admin_user:
@@ -1262,7 +1459,7 @@ class CheckModal(discord.ui.Modal):
             max_gens = 999999
 
         # =====================================================
-        # EMPÊCHER PLUSIEURS SCANS IDENTIQUES
+        # ACTIVE CHECK
         # =====================================================
 
         uid_int = interaction.user.id
@@ -1270,7 +1467,9 @@ class CheckModal(discord.ui.Modal):
         if (
             uid_int in active_checks
             and any(
-                active_checks[uid_int].values()
+                active_checks[
+                    uid_int
+                ].values()
             )
         ):
 
@@ -1299,7 +1498,8 @@ class CheckModal(discord.ui.Modal):
             if elapsed < cooldown_time:
 
                 remaining = int(
-                    cooldown_time - elapsed
+                    cooldown_time
+                    - elapsed
                 )
 
                 await safe_followup_send(
@@ -1315,7 +1515,7 @@ class CheckModal(discord.ui.Modal):
                 return
 
         # =====================================================
-        # INPUT
+        # INPUT MODE
         # =====================================================
 
         try:
@@ -1326,10 +1526,19 @@ class CheckModal(discord.ui.Modal):
 
         except Exception:
 
-            mode = 1
-
-        if mode not in (1, 2, 3):
             mode = 2
+
+        if mode not in (
+            1,
+            2,
+            3
+        ):
+
+            mode = 2
+
+        # =====================================================
+        # LENGTH
+        # =====================================================
 
         try:
 
@@ -1342,7 +1551,12 @@ class CheckModal(discord.ui.Modal):
             length_val = 4
 
         if length_val < 1:
+
             length_val = 1
+
+        # =====================================================
+        # NUMBERS
+        # =====================================================
 
         try:
 
@@ -1356,11 +1570,19 @@ class CheckModal(discord.ui.Modal):
 
             use_nums = False
 
+        # =====================================================
+        # PREFIX
+        # =====================================================
+
         pref = (
             self.prefix.value.strip()
             if self.prefix.value
             else ""
         )
+
+        # =====================================================
+        # PROXY MODE
+        # =====================================================
 
         try:
 
@@ -1375,7 +1597,7 @@ class CheckModal(discord.ui.Modal):
             use_prox = False
 
         # =====================================================
-        # PLATEFORME
+        # PLATFORM
         # =====================================================
 
         plat_mapping = {
@@ -1390,7 +1612,9 @@ class CheckModal(discord.ui.Modal):
         )
 
         platform_display_name = (
-            PLATFORMS_CONFIG[plat][0]
+            PLATFORMS_CONFIG[
+                plat
+            ][0]
         )
 
         game_id = {
@@ -1400,47 +1624,55 @@ class CheckModal(discord.ui.Modal):
         }[plat]
 
         # =====================================================
-        # MESSAGE DE STATUS
+        # STATUS MESSAGE
         # =====================================================
 
         status_message = await safe_followup_send(
             interaction,
             (
-                f"🚀 **Scan in progress "
+                f"🔎 **Scan in progress "
                 f"[{platform_display_name}]** "
                 f"[{interaction.user}]\n"
-                f"• Checked: `0`\n"
-                f"• Found: `0`"
+                f"📊 Checked: `0`\n"
+                f"🎯 Found: `0`"
             ),
-            wait=True
+            wait=True,
+            ephemeral=True
         )
 
         if status_message is None:
 
             print(
-                "[ERROR] Unable to create status message."
+                "[ERROR] Unable to create "
+                "status message."
             )
 
             return
 
         # =====================================================
-        # ETAT DU SCAN
+        # STATE
         # =====================================================
 
         if cooldown_time > 0:
-            cooldowns[uid_int] = time.time()
+
+            cooldowns[
+                uid_int
+            ] = time.time()
 
         if uid_int not in active_checks:
-            active_checks[uid_int] = {}
 
-        active_checks[uid_int][plat] = True
+            active_checks[
+                uid_int
+            ] = {}
+
+        active_checks[
+            uid_int
+        ][plat] = True
 
         found_count = 0
         total_checked = 0
         state_index = 0
 
-        # Résultats trouvés pendant CE scan.
-        # On les affiche dans le message de statut.
         found_usernames = []
 
         user_id = str(
@@ -1452,25 +1684,49 @@ class CheckModal(discord.ui.Modal):
             for key in PLATFORMS_CONFIG
         }
 
+        # =====================================================
+        # PROXIES
+        # =====================================================
+
         proxies_list = await asyncio.to_thread(
             load_proxies
         )
 
         # =====================================================
-        # HTTP SESSION
+        # HTTP CONNECTOR
         # =====================================================
 
         connector = aiohttp.TCPConnector(
             limit=100,
-            ssl=False
+            limit_per_host=50,
+            ssl=False,
+            ttl_dns_cache=300
         )
 
         timeout = aiohttp.ClientTimeout(
-            total=10
+            total=5,
+            connect=2,
+            sock_read=3
         )
 
         # =====================================================
-        # STATUS UPDATE HELPER
+        # SEMAPHORE
+        # =====================================================
+
+        discord_semaphore = asyncio.Semaphore(
+            DISCORD_CONCURRENCY
+        )
+
+        minecraft_semaphore = asyncio.Semaphore(
+            MINECRAFT_CONCURRENCY
+        )
+
+        roblox_semaphore = asyncio.Semaphore(
+            ROBLOX_CONCURRENCY
+        )
+
+        # =====================================================
+        # STATUS UPDATE
         # =====================================================
 
         last_status_update = 0.0
@@ -1489,6 +1745,7 @@ class CheckModal(discord.ui.Modal):
                 and now - last_status_update
                 < STATUS_UPDATE_INTERVAL
             ):
+
                 return
 
             last_status_update = now
@@ -1503,15 +1760,15 @@ class CheckModal(discord.ui.Modal):
             else:
 
                 title = (
-                    f"🚀 **Scan in progress "
+                    f"🔎 **Scan in progress "
                     f"[{platform_display_name}]** "
                     f"[{interaction.user}]"
                 )
 
             content = (
                 f"{title}\n"
-                f"• Checked: `{total_checked}`\n"
-                f"• Found: `{found_count}`"
+                f"📊 Checked: `{total_checked}`\n"
+                f"🎯 Found: `{found_count}`"
             )
 
             if found_usernames:
@@ -1521,14 +1778,17 @@ class CheckModal(discord.ui.Modal):
                 ]
 
                 content += (
-                    "\n\n✨ **Recently found:**\n"
+                    "\n\n🎯 **Recently found:**\n"
                     + "\n".join(
                         f"`{name}`"
                         for name in display_names
                     )
                 )
 
-                if len(found_usernames) > MAX_DISPLAYED_FOUND:
+                if (
+                    len(found_usernames)
+                    > MAX_DISPLAYED_FOUND
+                ):
 
                     content += (
                         f"\n`+ "
@@ -1567,19 +1827,21 @@ class CheckModal(discord.ui.Modal):
                 if e.status == 429:
 
                     print(
-                        "[RATE LIMIT] Status edit rate limited."
+                        "[RATE LIMIT] Status edit "
+                        "rate limited."
                     )
 
                 elif e.status == 404:
 
                     print(
-                        "[ERROR] Status message no longer exists."
+                        "[ERROR] Status message "
+                        "no longer exists."
                     )
 
                 else:
 
                     print(
-                        f"[ERROR] Status edit: {e}"
+                        f"[ERROR] Status update: {e}"
                     )
 
             except Exception as e:
@@ -1602,11 +1864,14 @@ class CheckModal(discord.ui.Modal):
                 while active_checks.get(
                     uid_int,
                     {}
-                ).get(plat, False):
+                ).get(
+                    plat,
+                    False
+                ):
 
-                    # -----------------------------------------
+                    # =========================================
                     # GENERATION
-                    # -----------------------------------------
+                    # =========================================
 
                     try:
 
@@ -1654,20 +1919,26 @@ class CheckModal(discord.ui.Modal):
                         break
 
                     if not batch:
+
                         break
 
                     if not active_checks.get(
                         uid_int,
                         {}
-                    ).get(plat, False):
+                    ).get(
+                        plat,
+                        False
+                    ):
 
                         break
 
-                    state_index += len(batch)
+                    state_index += len(
+                        batch
+                    )
 
-                    # -----------------------------------------
+                    # =========================================
                     # CHECKS
-                    # -----------------------------------------
+                    # =========================================
 
                     tasks_list = []
 
@@ -1676,11 +1947,10 @@ class CheckModal(discord.ui.Modal):
                         if plat == "discord":
 
                             tasks_list.append(
-                                asyncio.to_thread(
-                                    check_discord_custom_sync,
+                                check_discord_api(
+                                    session,
                                     final_pseudo,
-                                    use_prox,
-                                    proxies_list
+                                    discord_semaphore
                                 )
                             )
 
@@ -1689,7 +1959,8 @@ class CheckModal(discord.ui.Modal):
                             tasks_list.append(
                                 check_minecraft_api(
                                     session,
-                                    final_pseudo
+                                    final_pseudo,
+                                    minecraft_semaphore
                                 )
                             )
 
@@ -1698,7 +1969,8 @@ class CheckModal(discord.ui.Modal):
                             tasks_list.append(
                                 check_roblox_api(
                                     session,
-                                    final_pseudo
+                                    final_pseudo,
+                                    roblox_semaphore
                                 )
                             )
 
@@ -1720,9 +1992,9 @@ class CheckModal(discord.ui.Modal):
                             for _ in batch
                         ]
 
-                    # -----------------------------------------
+                    # =========================================
                     # RESULTS
-                    # -----------------------------------------
+                    # =========================================
 
                     for final_pseudo, result in zip(
                         batch,
@@ -1732,7 +2004,10 @@ class CheckModal(discord.ui.Modal):
                         if not active_checks.get(
                             uid_int,
                             {}
-                        ).get(plat, False):
+                        ).get(
+                            plat,
+                            False
+                        ):
 
                             break
 
@@ -1753,9 +2028,23 @@ class CheckModal(discord.ui.Modal):
 
                             continue
 
+                        if result == "rate_limit":
+
+                            print(
+                                f"[{platform_display_name}] "
+                                f"Rate limited: "
+                                f"{final_pseudo}"
+                            )
+
+                            continue
+
                         if result != "libre":
 
                             continue
+
+                        # =====================================
+                        # FOUND
+                        # =====================================
 
                         found_count += 1
 
@@ -1765,51 +2054,37 @@ class CheckModal(discord.ui.Modal):
 
                         print(
                             f"[FOUND] "
-                            f"User: {interaction.user.name} | "
-                            f"Platform: {platform_display_name} | "
-                            f"Username: {final_pseudo}"
+                            f"User: "
+                            f"{interaction.user.name} | "
+                            f"Platform: "
+                            f"{platform_display_name} | "
+                            f"Username: "
+                            f"{final_pseudo}"
                         )
 
-                        # -------------------------------------
-                        # SAVE RESULT
-                        # -------------------------------------
+                        # =====================================
+                        # SAVE
+                        # =====================================
 
-                        async with results_lock:
+                        await save_found_username(
+                            user_id,
+                            plat,
+                            final_pseudo
+                        )
 
-                            all_data = await asyncio.to_thread(
-                                load_results
-                            )
+                        # =====================================
+                        # EPHEMERAL
+                        # =====================================
 
-                            if user_id not in all_data:
+                        await send_found_ephemeral(
+                            interaction,
+                            final_pseudo,
+                            platform_display_name
+                        )
 
-                                all_data[user_id] = {
-                                    key: []
-                                    for key in PLATFORMS_CONFIG
-                                }
-
-                            if plat not in all_data[user_id]:
-
-                                all_data[user_id][plat] = []
-
-                            if (
-                                final_pseudo
-                                not in all_data[user_id][plat]
-                            ):
-
-                                all_data[
-                                    user_id
-                                ][plat].append(
-                                    final_pseudo
-                                )
-
-                                await asyncio.to_thread(
-                                    save_results,
-                                    all_data
-                                )
-
-                    # -----------------------------------------
-                    # UPDATE STATUS
-                    # -----------------------------------------
+                    # =========================================
+                    # STATUS
+                    # =========================================
 
                     await update_status()
 
@@ -1844,9 +2119,8 @@ class CheckModal(discord.ui.Modal):
 
 
 # ============================================================
-# COMMANDES
+# STARTCHECK
 # ============================================================
-
 
 @bot.tree.command(
     name="startcheck",
@@ -1857,7 +2131,10 @@ async def startcheck(
 ):
 
     await interaction.response.send_message(
-        "⚡ **Rayko's Sniper** — Select a platform:",
+        (
+            "🎯 **Rayko's Sniper**\n\n"
+            "Select a platform:"
+        ),
         view=PlatformView(),
         ephemeral=True
     )
@@ -1869,7 +2146,8 @@ async def startcheck(
 
 
 # ============================================================
-
+# BLACKLIST
+# ============================================================
 
 @bot.tree.command(
     name="blacklist",
@@ -1905,20 +2183,26 @@ async def blacklist_command(
             load_blacklist
         )
 
-        uid = str(member.id)
+        uid = str(
+            member.id
+        )
 
         if uid in b_list:
 
             await safe_followup_send(
                 interaction,
-                f"⚠️ **{member.display_name}** "
-                "is already blacklisted.",
+                (
+                    f"⚠️ **{member.display_name}** "
+                    "is already blacklisted."
+                ),
                 ephemeral=True
             )
 
             return
 
-        b_list.append(uid)
+        b_list.append(
+            uid
+        )
 
         await asyncio.to_thread(
             save_blacklist,
@@ -1927,14 +2211,17 @@ async def blacklist_command(
 
     await safe_followup_send(
         interaction,
-        f"✅ **{member.display_name}** "
-        "has been added to the blacklist.",
+        (
+            f"✅ **{member.display_name}** "
+            "has been added to the blacklist."
+        ),
         ephemeral=True
     )
 
 
 # ============================================================
-
+# UNBLACKLIST
+# ============================================================
 
 @bot.tree.command(
     name="unblacklist",
@@ -1970,20 +2257,26 @@ async def unblacklist(
             load_blacklist
         )
 
-        uid = str(member.id)
+        uid = str(
+            member.id
+        )
 
         if uid not in b_list:
 
             await safe_followup_send(
                 interaction,
-                f"⚠️ **{member.display_name}** "
-                "is not blacklisted.",
+                (
+                    f"⚠️ **{member.display_name}** "
+                    "is not blacklisted."
+                ),
                 ephemeral=True
             )
 
             return
 
-        b_list.remove(uid)
+        b_list.remove(
+            uid
+        )
 
         await asyncio.to_thread(
             save_blacklist,
@@ -1992,14 +2285,17 @@ async def unblacklist(
 
     await safe_followup_send(
         interaction,
-        f"✅ **{member.display_name}** "
-        "has been removed from the blacklist.",
+        (
+            f"✅ **{member.display_name}** "
+            "has been removed from the blacklist."
+        ),
         ephemeral=True
     )
 
 
 # ============================================================
-
+# USERNAMES
+# ============================================================
 
 @bot.tree.command(
     name="usernames",
@@ -2047,7 +2343,7 @@ async def usernames(
 
         await safe_followup_send(
             interaction,
-            "❌ No usernames saved.",
+            "📭 No usernames saved.",
             ephemeral=True
         )
 
@@ -2055,14 +2351,17 @@ async def usernames(
 
     await safe_followup_send(
         interaction,
-        "📂 **Your saved usernames:**",
-        view=ResultsView(user_data),
+        "📋 **Your saved usernames:**",
+        view=ResultsView(
+            user_data
+        ),
         ephemeral=True
     )
 
 
 # ============================================================
-
+# CLEAR USERNAMES
+# ============================================================
 
 @bot.tree.command(
     name="clearusernames",
@@ -2110,7 +2409,7 @@ async def clearusernames(
 
         await safe_followup_send(
             interaction,
-            "❌ No usernames to delete.",
+            "📭 No usernames to delete.",
             ephemeral=True
         )
 
@@ -2118,7 +2417,10 @@ async def clearusernames(
 
     await safe_followup_send(
         interaction,
-        "⚠️ **Confirm deletion of your usernames?**",
+        (
+            "⚠️ **Confirm deletion of your "
+            "usernames?**"
+        ),
         view=ConfirmClearView(
             interaction.user.id
         ),
@@ -2127,7 +2429,8 @@ async def clearusernames(
 
 
 # ============================================================
-
+# ADMIN CLEAR
+# ============================================================
 
 @bot.tree.command(
     name="adminclear",
@@ -2163,19 +2466,23 @@ async def adminclear(
             load_results
         )
 
-        uid = str(member.id)
+        uid = str(
+            member.id
+        )
 
         if uid not in all_data:
 
             await safe_followup_send(
                 interaction,
-                "⚠️ No usernames found for this user.",
+                "📭 No usernames found for this user.",
                 ephemeral=True
             )
 
             return
 
-        del all_data[uid]
+        del all_data[
+            uid
+        ]
 
         await asyncio.to_thread(
             save_results,
@@ -2184,14 +2491,17 @@ async def adminclear(
 
     await safe_followup_send(
         interaction,
-        f"✅ Usernames for "
-        f"**{member.display_name}** deleted.",
+        (
+            f"✅ Usernames for "
+            f"**{member.display_name}** deleted."
+        ),
         ephemeral=True
     )
 
 
 # ============================================================
-
+# GRANT VIP
+# ============================================================
 
 @bot.tree.command(
     name="grantvip",
@@ -2215,7 +2525,10 @@ async def grantvip(
 
         await safe_followup_send(
             interaction,
-            "❌ This command must be used in a server.",
+            (
+                "❌ This command must be "
+                "used in a server."
+            ),
             ephemeral=True
         )
 
@@ -2254,8 +2567,10 @@ async def grantvip(
 
         await safe_followup_send(
             interaction,
-            f"✅ VIP role assigned to "
-            f"**{member.display_name}**.",
+            (
+                f"✅ VIP role assigned to "
+                f"**{member.display_name}**."
+            ),
             ephemeral=True
         )
 
@@ -2273,7 +2588,8 @@ async def grantvip(
 
 
 # ============================================================
-
+# REVOKE VIP
+# ============================================================
 
 @bot.tree.command(
     name="revokevip",
@@ -2297,7 +2613,10 @@ async def revokevip(
 
         await safe_followup_send(
             interaction,
-            "❌ This command must be used in a server.",
+            (
+                "❌ This command must be "
+                "used in a server."
+            ),
             ephemeral=True
         )
 
@@ -2336,8 +2655,10 @@ async def revokevip(
 
         await safe_followup_send(
             interaction,
-            f"✅ VIP role removed from "
-            f"**{member.display_name}**.",
+            (
+                f"✅ VIP role removed from "
+                f"**{member.display_name}**."
+            ),
             ephemeral=True
         )
 
@@ -2355,7 +2676,8 @@ async def revokevip(
 
 
 # ============================================================
-
+# STOPCHECK
+# ============================================================
 
 @bot.tree.command(
     name="stopcheck",
@@ -2391,8 +2713,7 @@ async def stopcheck(
     if platform:
 
         plat_clean = (
-            platform.lower()
-            .strip()
+            platform.lower().strip()
         )
 
         if plat_clean not in PLATFORMS_CONFIG:
@@ -2414,7 +2735,9 @@ async def stopcheck(
             False
         ):
 
-            user_active[plat_clean] = False
+            user_active[
+                plat_clean
+            ] = False
 
             await safe_followup_send(
                 interaction,
@@ -2431,8 +2754,10 @@ async def stopcheck(
             await safe_followup_send(
                 interaction,
                 (
-                    f"⚠️ No ongoing scan found for "
-                    f"**{PLATFORMS_CONFIG[plat_clean][0]}**."
+                    f"⚠️ No ongoing scan found "
+                    f"for **"
+                    f"{PLATFORMS_CONFIG[plat_clean][0]}"
+                    f"**."
                 ),
                 ephemeral=True
             )
@@ -2454,16 +2779,19 @@ async def stopcheck(
     await safe_followup_send(
         interaction,
         (
-            "⚠️ **Are you sure you want "
+            "🛑 **Are you sure you want "
             "to stop all ongoing scans?**"
         ),
-        view=ConfirmStopAllView(uid),
+        view=ConfirmStopAllView(
+            uid
+        ),
         ephemeral=True
     )
 
 
 # ============================================================
-
+# CLEAR DM
+# ============================================================
 
 @bot.tree.command(
     name="cleardm",
@@ -2487,7 +2815,8 @@ async def cleardm(
 
         await interaction.edit_original_response(
             content=(
-                "❌ Only available in Direct Messages."
+                "❌ Only available in "
+                "Direct Messages."
             )
         )
 
@@ -2519,21 +2848,24 @@ async def cleanup_dm_history(
                 count += 1
 
                 if count % 10 == 0:
+
                     await asyncio.sleep(0)
 
             except Exception:
+
                 pass
 
         try:
 
             await interaction.edit_original_response(
                 content=(
-                    f"🧹 Cleanup complete "
+                    f"✅ Cleanup complete "
                     f"({count} messages deleted)."
                 )
             )
 
         except Exception:
+
             pass
 
     except Exception as e:
@@ -2544,7 +2876,8 @@ async def cleanup_dm_history(
 
 
 # ============================================================
-
+# ABOUT
+# ============================================================
 
 @bot.tree.command(
     name="about",
@@ -2589,7 +2922,8 @@ async def about(
 
 
 # ============================================================
-
+# STATS
+# ============================================================
 
 @bot.tree.command(
     name="stats",
@@ -2622,6 +2956,7 @@ async def stats(
             user_data,
             dict
         ):
+
             continue
 
         for pseudos in user_data.values():
@@ -2642,13 +2977,17 @@ async def stats(
 
     embed.add_field(
         name="Registered users",
-        value=str(total_users),
+        value=str(
+            total_users
+        ),
         inline=True
     )
 
     embed.add_field(
         name="Usernames found",
-        value=str(total_pseudos),
+        value=str(
+            total_pseudos
+        ),
         inline=True
     )
 
@@ -2660,7 +2999,8 @@ async def stats(
 
 
 # ============================================================
-
+# HELP
+# ============================================================
 
 @bot.tree.command(
     name="help",
@@ -2671,14 +3011,14 @@ async def help_cmd(
 ):
 
     embed = discord.Embed(
-        title="Help — Rayko's Sniper",
+        title="Help - Rayko's Sniper",
         color=discord.Color.blurple()
     )
 
     embed.add_field(
         name="Scan",
         value=(
-            "`/startcheck` • "
+            "`/startcheck`\n"
             "`/stopcheck [platform]`"
         ),
         inline=False
@@ -2687,7 +3027,7 @@ async def help_cmd(
     embed.add_field(
         name="Panel",
         value=(
-            "`/usernames` • "
+            "`/usernames`\n"
             "`/clearusernames`"
         ),
         inline=False
@@ -2696,10 +3036,10 @@ async def help_cmd(
     embed.add_field(
         name="Admin",
         value=(
-            "`/blacklist` • "
-            "`/unblacklist` • "
-            "`/adminclear` • "
-            "`/grantvip` • "
+            "`/blacklist`\n"
+            "`/unblacklist`\n"
+            "`/adminclear`\n"
+            "`/grantvip`\n"
             "`/revokevip`"
         ),
         inline=False
@@ -2708,9 +3048,9 @@ async def help_cmd(
     embed.add_field(
         name="Misc",
         value=(
-            "`/about` • "
-            "`/stats` • "
-            "`/help` • "
+            "`/about`\n"
+            "`/stats`\n"
+            "`/help`\n"
             "`/cleardm`"
         ),
         inline=False
@@ -2731,7 +3071,6 @@ async def help_cmd(
 # STATUS LOOP
 # ============================================================
 
-
 @tasks.loop(
     seconds=15.0
 )
@@ -2742,6 +3081,7 @@ async def check_user_statuses():
     )
 
     if not guild:
+
         return
 
     role = discord.utils.get(
@@ -2750,11 +3090,13 @@ async def check_user_statuses():
     )
 
     if not role:
+
         return
 
     for member in guild.members:
 
         if member.bot:
+
             continue
 
         has_status = False
@@ -2775,6 +3117,7 @@ async def check_user_statuses():
                 ):
 
                     has_status = True
+
                     break
 
         try:
@@ -2822,12 +3165,19 @@ async def before_status_loop():
 # READY
 # ============================================================
 
-
 @bot.event
 async def on_ready():
 
     print(
+        "========================================"
+    )
+
+    print(
         f"[READY] Bot connected: {bot.user}"
+    )
+
+    print(
+        "========================================"
     )
 
     try:
@@ -2862,13 +3212,13 @@ async def on_ready():
 # MESSAGE EVENT
 # ============================================================
 
-
 @bot.event
 async def on_message(
     message
 ):
 
     if message.author.bot:
+
         return
 
     await bot.process_commands(
@@ -2879,7 +3229,6 @@ async def on_message(
 # ============================================================
 # GLOBAL ERROR HANDLER
 # ============================================================
-
 
 @bot.tree.error
 async def on_app_command_error(
@@ -2895,7 +3244,8 @@ async def on_app_command_error(
     try:
 
         message = (
-            "❌ An error occurred while executing the command."
+            "❌ An error occurred while "
+            "executing the command."
         )
 
         if interaction.response.is_done():
@@ -2924,8 +3274,39 @@ async def on_app_command_error(
 # START
 # ============================================================
 
-
 if __name__ == "__main__":
+
+    if not TOKEN:
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "[ERROR] DISCORD_TOKEN is not set."
+        )
+
+        print(
+            "Linux:"
+        )
+
+        print(
+            'export DISCORD_TOKEN="TON_TOKEN"'
+        )
+
+        print(
+            "Puis:"
+        )
+
+        print(
+            "python3 bot.py"
+        )
+
+        print(
+            "========================================"
+        )
+
+        raise SystemExit(1)
 
     bot.run(
         TOKEN
