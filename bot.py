@@ -34,7 +34,7 @@ from gen import (
 # Linux :
 # export DISCORD_TOKEN="TON_NOUVEAU_TOKEN"
 
-TOKEN = os.getenv("MTUxNzYyNDI3OTkyNjE4MTkwOA.GZi_ba.3AK-oI0nejxAl5YnoDp-EEp9tGdOp56b_IXALo")
+TOKEN = os.getenv("DISCORD_TOKEN")
 
 
 OFFICIAL_GUILD_ID = 1320431531386208386
